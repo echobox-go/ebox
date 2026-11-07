@@ -1,0 +1,9 @@
+[Unit]
+Description=echobox-go: push environment to the server
+Documentation=https://github.com/echobox-go
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ebox push

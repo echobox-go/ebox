@@ -1,0 +1,13 @@
+# /etc/ebox/ebox.conf: public settings for ebox. On live sticks the builder
+# writes this file from profile.yaml. On an installed machine, copy this example.
+# Never put credentials here; `ebox enrol` stores those in /var/lib/ebox.
+EBOX_USER=niklas
+EBOX_PORTAL_URL=https://portal.example.org
+EBOX_DESKTOP=plasma
+EBOX_SETTINGS_TOOL=konsave      # konsave | dconf | none
+EBOX_HOME_PATHS='Documents Projects .ssh'
+EBOX_SYNC_DOTFILES=1
+EBOX_SYNC_DESKTOP=1
+EBOX_SYNC_PACKAGES=1
+# EBOX_ACONFMGR_FLAGS=          # extra aconfmgr flags, e.g. to apply without prompts
+# EBOX_TUNNEL_UP_CMD=           # command that starts this device's Pangolin client

@@ -1,0 +1,10 @@
+[Unit]
+Description=echobox-go: daily push (opt-in: systemctl enable --now ebox-push.timer)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

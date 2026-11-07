@@ -1,0 +1,32 @@
+# Maintainer: echobox-go <https://github.com/echobox-go>
+#
+# Builds the ebox package from this checkout:
+#   cd ebox/packaging && makepkg -s
+# Published to the echobox pacman repo on eb-build (see infra/build/README.md).
+
+pkgname=ebox
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="echobox-go CLI: sync your Linux environment with your own server"
+arch=('any')
+url="https://github.com/echobox-go/ebox"
+license=('LicenseRef-TBD')  # TODO: pick the project licence (GPL-3.0 vs MIT/Apache-2.0) before publishing
+depends=('bash' 'curl' 'jq' 'git' 'restic' 'chezmoi' 'cryptsetup' 'util-linux' 'sudo')
+optdepends=(
+  'aconfmgr-git: capture and apply packages and /etc changes'
+  'konsave: KDE Plasma settings'
+  'dconf: GNOME settings'
+  'bitwarden-cli: secrets from Vaultwarden'
+)
+backup=('etc/ebox/ebox.conf')
+source=()
+
+package() {
+  local src="$startdir/.."
+  install -Dm755 "$src/bin/ebox" "$pkgdir/usr/bin/ebox"
+  install -Dm644 "$src/etc/ebox.conf.example" "$pkgdir/etc/ebox/ebox.conf"
+  local unit
+  for unit in "$src"/systemd/ebox-*; do
+    install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/system/${unit##*/}"
+  done
+}

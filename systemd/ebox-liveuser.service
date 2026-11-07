@@ -1,0 +1,13 @@
+[Unit]
+Description=echobox-go: create the live user
+Documentation=https://github.com/echobox-go
+ConditionPathExists=/etc/ebox/ebox.conf
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ebox liveuser
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

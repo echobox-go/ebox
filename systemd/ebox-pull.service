@@ -1,0 +1,15 @@
+[Unit]
+Description=echobox-go: unlock persistence and pull the latest environment
+Documentation=https://github.com/echobox-go
+Wants=network-online.target
+After=network-online.target ebox-liveuser.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/local/bin/ebox persist-open
+ExecStart=/usr/local/bin/ebox pull --boot
+RemainAfterExit=yes
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

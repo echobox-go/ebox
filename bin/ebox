@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# ebox: the echobox-go CLI.
+#
+#   ebox enrol [--code CODE]   pair this machine or stick with the portal
+#   ebox push  [--image]       save packages, /etc, dotfiles, desktop settings, home files
+#   ebox pull  [--boot]        restore the latest environment from the server
+#   ebox build                 ask the portal to rebuild your ISO
+#   ebox status                show enrolment and sync state
+#
+# Internal (used by systemd units): liveuser, persist-open
+#
+# Wraps aconfmgr (packages + /etc), chezmoi (dotfiles), konsave / dconf
+# (desktop settings) and restic (home files). Public settings come from
+# /etc/ebox/ebox.conf (written by the builder); credentials from enrolment live
+# in $EBOX_STATE_DIR, which is the LUKS persistence partition on a stick.
+
+set -euo pipefail
+
+EBOX_VERSION="0.1.0"
+EBOX_CONF="${EBOX_CONF:-/etc/ebox/ebox.conf}"
+EBOX_STATE_DIR="${EBOX_STATE_DIR:-/var/lib/ebox}"
+EBOX_PERSIST_LABEL="${EBOX_PERSIST_LABEL:-EBOX_PERSIST}"
+
+# ----------------------------------------------------------------------------- output
+
+if [[ -t 2 ]]; then
+    c_teal=$'\e[38;2;45;212;191m' c_dim=$'\e[2m' c_red=$'\e[31m' c_off=$'\e[0m'
+else
+    c_teal="" c_dim="" c_red="" c_off=""
+fi
+
+say()  { printf '%s>%s %s\n' "$c_teal" "$c_off" "$*" >&2; }
+note() { printf '%s  %s%s\n' "$c_dim" "$*" "$c_off" >&2; }
+warn() { printf '%swarning:%s %s\n' "$c_red" "$c_off" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "$1 is not installed"; }
+need_root() { [[ $EUID -eq 0 ]] || die "run as root: sudo ebox $*"; }
+
+# ----------------------------------------------------------------------------- config
+
+load_config() {
+    # shellcheck source=/dev/null
+    [[ -r "$EBOX_CONF" ]] && . "$EBOX_CONF"
+    EBOX_USER="${EBOX_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
+    EBOX_PORTAL_URL="${EBOX_PORTAL_URL:-}"
+    EBOX_SHELL="${EBOX_SHELL:-/bin/bash}"
+    EBOX_GROUPS="${EBOX_GROUPS:-wheel}"
+    EBOX_SETTINGS_TOOL="${EBOX_SETTINGS_TOOL:-none}"
+    EBOX_HOME_PATHS="${EBOX_HOME_PATHS:-}"
+    EBOX_SYNC_DOTFILES="${EBOX_SYNC_DOTFILES:-1}"
+    EBOX_SYNC_DESKTOP="${EBOX_SYNC_DESKTOP:-1}"
+    EBOX_SYNC_PACKAGES="${EBOX_SYNC_PACKAGES:-1}"
+    # aconfmgr apply asks before every change. Extra flags (for example to
+    # assume yes) can be set here once verified against the installed version.
+    EBOX_ACONFMGR_FLAGS="${EBOX_ACONFMGR_FLAGS:-}"
+    # Command that brings up this device's Pangolin client tunnel.
+    # TODO(phase 2): replace with the Pangolin client CLI once pinned.
+    EBOX_TUNNEL_UP_CMD="${EBOX_TUNNEL_UP_CMD:-}"
+    EBOX_HOME="$(getent passwd "$EBOX_USER" | cut -d: -f6 || true)"
+    EBOX_HOME="${EBOX_HOME:-/home/$EBOX_USER}"
+    CREDS="$EBOX_STATE_DIR/credentials.env"
+    STATE_REPO_DIR="$EBOX_STATE_DIR/state"
+}
+
+load_credentials() {
+    [[ -r "$CREDS" ]] || return 1
+    # shellcheck source=/dev/null
+    . "$CREDS"
+    export RESTIC_REPOSITORY RESTIC_PASSWORD
+}
+
+is_enrolled() { [[ -r "$CREDS" ]]; }
+
+as_user() { runuser -u "$EBOX_USER" -- "$@"; }
+
+stamp() { date -u +%Y-%m-%dT%H:%M:%SZ > "$EBOX_STATE_DIR/last-$1"; }
+
+# ----------------------------------------------------------------------------- portal
+
+portal() {
+    # portal METHOD PATH [JSON]
+    local method="$1" path="$2" body="${3:-}"
+    [[ -n "$EBOX_PORTAL_URL" ]] || die "EBOX_PORTAL_URL is not set in $EBOX_CONF"
+    local args=(--fail-with-body --silent --show-error -X "$method"
+                -H "Accept: application/json" -H "User-Agent: ebox/$EBOX_VERSION")
+    [[ -n "${EBOX_DEVICE_TOKEN:-}" ]] && args+=(-H "Authorization: Bearer $EBOX_DEVICE_TOKEN")
+    [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data "$body")
+    curl "${args[@]}" "${EBOX_PORTAL_URL%/}$path"
+}
+
+tunnel_up() {
+    if [[ -n "$EBOX_TUNNEL_UP_CMD" ]]; then
+        note "bringing up tunnel"
+        bash -c "$EBOX_TUNNEL_UP_CMD" || die "tunnel command failed"
+    else
+        note "no tunnel command configured; assuming the server is reachable"
+    fi
+}
+
+# ----------------------------------------------------------------------------- state repo
+
+state_repo_sync() {
+    [[ -n "${EBOX_STATE_REPO:-}" ]] || { warn "no state repo from enrolment; skipping"; return 1; }
+    if [[ -d "$STATE_REPO_DIR/.git" ]]; then
+        git -C "$STATE_REPO_DIR" pull --ff-only --quiet
+    else
+        git clone --quiet "$EBOX_STATE_REPO" "$STATE_REPO_DIR"
+    fi
+}
+
+state_repo_commit() {
+    local msg="$1"
+    git -C "$STATE_REPO_DIR" add -A
+    if git -C "$STATE_REPO_DIR" diff --cached --quiet; then
+        note "state repo unchanged"
+        return 0
+    fi
+    git -C "$STATE_REPO_DIR" -c user.name="ebox ($(hostname))" -c user.email="ebox@localhost" \
+        commit --quiet -m "$msg"
+    git -C "$STATE_REPO_DIR" push --quiet
+    say "state pushed"
+}
+
+# ----------------------------------------------------------------------------- commands
+
+cmd_enrol() {
+    need_root enrol
+    need curl; need jq
+    local code=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --code) code="$2"; shift 2 ;;
+            *) die "unknown option $1" ;;
+        esac
+    done
+    if is_enrolled; then
+        say "already enrolled ($CREDS). Revoke this device in the portal to re-enrol."
+        return 0
+    fi
+    if [[ -z "$code" ]]; then
+        say "Open ${EBOX_PORTAL_URL:-the portal} → Devices → Add device, then enter the code shown there."
+        read -r -p "Enrolment code: " code
+    fi
+    [[ "$code" =~ ^[A-Za-z0-9-]{6,32}$ ]] || die "that does not look like an enrolment code"
+
+    local body resp
+    body="$(jq -n --arg code "$code" --arg host "$(hostname)" --arg user "$EBOX_USER" \
+        '{code: $code, hostname: $host, user: $user}')"
+    resp="$(portal POST /api/agent/enrol "$body")" || die "enrolment failed: $resp"
+
+    install -d -m 700 "$EBOX_STATE_DIR"
+    umask 077
+    # Only known keys are written; values are shell-quoted.
+    jq -r '
+        {EBOX_DEVICE_ID: .device_id, EBOX_DEVICE_TOKEN: .device_token,
+         EBOX_STATE_REPO: .state_repo, EBOX_DOTFILES_REPO: .dotfiles_repo,
+         RESTIC_REPOSITORY: .restic_repository, RESTIC_PASSWORD: .restic_password,
+         EBOX_PANGOLIN_ID: .pangolin_id, EBOX_PANGOLIN_SECRET: .pangolin_secret}
+        | to_entries[] | select(.value != null) | "\(.key)=\(.value | @sh)"' \
+        <<<"$resp" > "$CREDS.tmp"
+    mv "$CREDS.tmp" "$CREDS"
+    say "enrolled as device $(jq -r '.device_id' <<<"$resp")"
+    note "credentials stored in $CREDS"
+    [[ -d /run/archiso ]] && [[ "${EBOX_PERSISTENCE:-none}" == none ]] && \
+        warn "this live system has no persistence; enrolment is lost at shutdown"
+    return 0
+}
+
+cmd_push() {
+    need_root push
+    local image=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --image) image=1; shift ;;
+            *) die "unknown option $1" ;;
+        esac
+    done
+    load_credentials || die "not enrolled; run: sudo ebox enrol"
+    if (( image )); then
+        # Mode B: whole-system encrypted image via penguins-eggs.
+        # TODO(phase 5): pin a tested penguins-eggs version and wrap its remaster command.
+        die "--image is not implemented yet"
+    fi
+    tunnel_up
+    local have_state=0
+    state_repo_sync && have_state=1
+
+    if [[ "$EBOX_SYNC_PACKAGES" == 1 && $have_state == 1 ]]; then
+        if have aconfmgr; then
+            say "packages and /etc (aconfmgr save)"
+            mkdir -p "$STATE_REPO_DIR/aconfmgr"
+            aconfmgr -c "$STATE_REPO_DIR/aconfmgr" save
+        else
+            warn "aconfmgr not installed; skipping packages"
+        fi
+    fi
+
+    if [[ "$EBOX_SYNC_DOTFILES" == 1 ]]; then
+        if have chezmoi && as_user chezmoi source-path >/dev/null 2>&1; then
+            say "dotfiles (chezmoi)"
+            as_user chezmoi re-add
+            if [[ -n "$(as_user chezmoi git -- status --porcelain)" ]]; then
+                as_user chezmoi git -- add -A
+                as_user chezmoi git -- commit --quiet -m "ebox push from $(hostname)"
+                as_user chezmoi git -- push --quiet
+            else
+                note "dotfiles unchanged"
+            fi
+        else
+            warn "chezmoi not initialised for $EBOX_USER; skipping dotfiles"
+        fi
+    fi
+
+    if [[ "$EBOX_SYNC_DESKTOP" == 1 && $have_state == 1 ]]; then
+        mkdir -p "$STATE_REPO_DIR/desktop"
+        case "$EBOX_SETTINGS_TOOL" in
+            konsave)
+                if have konsave; then
+                    say "desktop settings (konsave)"
+                    as_user konsave -s ebox -f
+                    # TODO(phase 3): verify export flags against the pinned konsave version.
+                    as_user konsave -e ebox -d "$EBOX_HOME" -n ebox -f
+                    mv -f "$EBOX_HOME/ebox.knsv" "$STATE_REPO_DIR/desktop/ebox.knsv"
+                else
+                    warn "konsave not installed; skipping desktop settings"
+                fi ;;
+            dconf)
+                say "desktop settings (dconf)"
+                as_user dconf dump / > "$STATE_REPO_DIR/desktop/dconf.ini" ;;
+            *) note "no desktop settings tool for this desktop" ;;
+        esac
+    fi
+
+    (( have_state )) && state_repo_commit "ebox push from $(hostname)"
+
+    if [[ -n "$EBOX_HOME_PATHS" ]]; then
+        need restic
+        local paths=() p
+        for p in $EBOX_HOME_PATHS; do
+            [[ -e "$EBOX_HOME/$p" ]] && paths+=("$EBOX_HOME/$p")
+        done
+        if (( ${#paths[@]} )); then
+            say "home files (restic backup)"
+            restic backup --quiet --tag ebox-home --host "ebox-$EBOX_USER" "${paths[@]}"
+        fi
+    fi
+    stamp push
+    say "push done"
+}
+
+cmd_pull() {
+    need_root pull
+    local boot=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --boot) boot=1; shift ;;
+            *) die "unknown option $1" ;;
+        esac
+    done
+    if ! load_credentials; then
+        (( boot )) && { note "not enrolled; nothing to pull"; return 0; }
+        die "not enrolled; run: sudo ebox enrol"
+    fi
+    tunnel_up
+    local have_state=0
+    state_repo_sync && have_state=1
+
+    if [[ -n "${RESTIC_REPOSITORY:-}" ]] && have restic; then
+        say "home files (restic restore)"
+        restic restore latest --quiet --tag ebox-home --host "ebox-$EBOX_USER" --target / \
+            || warn "nothing to restore yet"
+        chown -R "$EBOX_USER:" "$EBOX_HOME"
+    fi
+
+    if [[ "$EBOX_SYNC_DOTFILES" == 1 && -n "${EBOX_DOTFILES_REPO:-}" ]] && have chezmoi; then
+        say "dotfiles (chezmoi)"
+        if as_user chezmoi source-path >/dev/null 2>&1; then
+            as_user chezmoi update --force
+        else
+            as_user chezmoi init --apply --force "$EBOX_DOTFILES_REPO"
+        fi
+    fi
+
+    if [[ "$EBOX_SYNC_DESKTOP" == 1 && $have_state == 1 ]]; then
+        case "$EBOX_SETTINGS_TOOL" in
+            konsave)
+                if have konsave && [[ -f "$STATE_REPO_DIR/desktop/ebox.knsv" ]]; then
+                    say "desktop settings (konsave)"
+                    as_user konsave -i "$STATE_REPO_DIR/desktop/ebox.knsv" -f
+                    as_user konsave -a ebox
+                fi ;;
+            dconf)
+                if [[ -f "$STATE_REPO_DIR/desktop/dconf.ini" ]]; then
+                    say "desktop settings (dconf)"
+                    as_user dconf load / < "$STATE_REPO_DIR/desktop/dconf.ini"
+                fi ;;
+        esac
+    fi
+
+    if [[ "$EBOX_SYNC_PACKAGES" == 1 && $have_state == 1 && -d "$STATE_REPO_DIR/aconfmgr" ]]; then
+        if ! have aconfmgr; then
+            warn "aconfmgr not installed; skipping packages"
+        elif (( boot )) && [[ -z "$EBOX_ACONFMGR_FLAGS" ]]; then
+            note "packages not applied at boot (aconfmgr is interactive); run: sudo ebox pull"
+        else
+            say "packages and /etc (aconfmgr apply)"
+            # shellcheck disable=SC2086 # flags are word-split on purpose
+            aconfmgr -c "$STATE_REPO_DIR/aconfmgr" $EBOX_ACONFMGR_FLAGS apply
+        fi
+    fi
+    stamp pull
+    say "pull done"
+}
+
+cmd_build() {
+    need curl
+    load_credentials || die "not enrolled; run: sudo ebox enrol"
+    say "requesting a new ISO build"
+    local resp
+    resp="$(portal POST /api/agent/build '{}')" || die "build request failed: $resp"
+    if have jq; then jq . <<<"$resp"; else printf '%s\n' "$resp"; fi
+}
+
+cmd_status() {
+    printf '%sebox%s %s\n' "$c_teal" "$c_off" "$EBOX_VERSION"
+    printf '  user       %s\n' "$EBOX_USER"
+    printf '  portal     %s\n' "${EBOX_PORTAL_URL:-(not set)}"
+    printf '  desktop    %s (%s)\n' "${EBOX_DESKTOP:-?}" "$EBOX_SETTINGS_TOOL"
+    if [[ $EUID -eq 0 ]] && load_credentials; then
+        printf '  enrolled   yes (device %s)\n' "${EBOX_DEVICE_ID:-?}"
+    elif [[ -e "$CREDS" ]]; then
+        printf '  enrolled   yes (run as root for details)\n'
+    else
+        printf '  enrolled   no\n'
+    fi
+    local k
+    for k in push pull; do
+        printf '  last %s  %s\n' "$k" "$(cat "$EBOX_STATE_DIR/last-$k" 2>/dev/null || echo never)"
+    done
+    if mountpoint -q "$EBOX_STATE_DIR" 2>/dev/null; then
+        printf '  persist    mounted at %s\n' "$EBOX_STATE_DIR"
+    else
+        printf '  persist    not mounted\n'
+    fi
+}
+
+# Create the live user from /etc/ebox/ebox.conf (ebox-liveuser.service).
+cmd_liveuser() {
+    need_root liveuser
+    local g
+    for g in ${EBOX_GROUPS//,/ }; do
+        getent group "$g" >/dev/null || groupadd -r "$g"
+    done
+    if ! id "$EBOX_USER" >/dev/null 2>&1; then
+        useradd -m -s "$EBOX_SHELL" -G "${EBOX_GROUPS// /,}" -c "${EBOX_DISPLAY_NAME:-$EBOX_USER}" "$EBOX_USER"
+        passwd -d "$EBOX_USER" >/dev/null
+        say "created live user $EBOX_USER"
+    fi
+    # Live session only: the ISO carries no secrets and persistence is LUKS-locked.
+    if [[ -d /run/archiso ]] && [[ -d /etc/sudoers.d ]]; then
+        local f=/etc/sudoers.d/10-ebox-live
+        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$EBOX_USER" > "$f.tmp"
+        chmod 440 "$f.tmp"
+        if visudo -cqf "$f.tmp"; then mv "$f.tmp" "$f"; else rm -f "$f.tmp"; fi
+    fi
+}
+
+# Unlock and mount the persistence partition at $EBOX_STATE_DIR (ebox-pull.service).
+cmd_persist_open() {
+    need_root persist-open
+    mountpoint -q "$EBOX_STATE_DIR" && return 0
+    local dev
+    dev="$(blkid -t PARTLABEL="$EBOX_PERSIST_LABEL" -o device 2>/dev/null | head -n1 || true)"
+    if [[ -z "$dev" ]]; then
+        note "no persistence partition ($EBOX_PERSIST_LABEL); state lives in RAM"
+        # TODO(phase 5): offer to create it in the stick's free space during enrol.
+        return 0
+    fi
+    if [[ ! -e /dev/mapper/ebox-persist ]]; then
+        if have systemd-ask-password && [[ ! -t 0 ]]; then
+            systemd-ask-password "echobox-go: passphrase for your stick" \
+                | cryptsetup open --key-file=- "$dev" ebox-persist
+        else
+            cryptsetup open "$dev" ebox-persist
+        fi
+    fi
+    install -d -m 700 "$EBOX_STATE_DIR"
+    mount /dev/mapper/ebox-persist "$EBOX_STATE_DIR"
+    say "persistence mounted at $EBOX_STATE_DIR"
+}
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    local cmd="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    load_config
+    case "$cmd" in
+        enrol|enroll) cmd_enrol "$@" ;;
+        push)         cmd_push "$@" ;;
+        pull)         cmd_pull "$@" ;;
+        build)        cmd_build "$@" ;;
+        status)       cmd_status "$@" ;;
+        liveuser)     cmd_liveuser "$@" ;;
+        persist-open) cmd_persist_open "$@" ;;
+        version|--version) echo "ebox $EBOX_VERSION" ;;
+        ""|help|-h|--help) usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"
